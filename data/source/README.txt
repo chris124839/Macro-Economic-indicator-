@@ -1,0 +1,1 @@
+Commit the India CPI/WPI/RBI data files you already uploaded to GitHub into this folder, or change SOURCE_DIR in collect_india.py to their current repository path. Supported formats: CSV and XLSX. See the root README for accepted columns.
