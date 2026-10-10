@@ -1,0 +1,1 @@
+pandas>=2.2,<3.0\nopenpyxl>=3.1,<4.0\nstreamlit>=1.40,<2.0\nplotly>=5.24,<7.0\n
