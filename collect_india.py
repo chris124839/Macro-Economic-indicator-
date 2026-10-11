@@ -116,20 +116,29 @@ def observation(indicator, period, value, unit, source_name):
 
 
 def fetch_rates():
-    """Read RBI DBIE Key Rates from either typed columns or report-grid rows."""
+    """Read RBI DBIE Key Rates from typed columns or its spreadsheet-grid export.
+
+    DBIE can expose this particular report as c1..c8 rather than named rate columns.
+    The published Key Rates table's leaf-column order is:
+      c1 Effective Date, c2 Bank Rate, c3 Repo, c4 Reverse Repo,
+      c5 SDF, c6 MSF, c7 CRR, c8 SLR.
+    The parent heading "Fix Range LAF Rates" spans the Repo and Reverse Repo columns.
+    A dash in a rate cell means no change, so the last published value is carried
+    forward. SDF remains blank until its first actual value in April 2022.
+    """
     rows = fetch_csv(f"{API}/api/tables/financial_sector/r531_key_rates/csv")
     if not rows:
         raise RuntimeError("RBI Key Rates table returned no rows")
+
     first = rows[0]
     date_col = find_column(first, ["effective_date", "effective date", "date", "time_period", "period"])
     rate_cols = {
-        "rbi_repo": find_column(first, ["repo", "repo rate", "policy repo rate"]),
-        "rbi_reverse_repo": find_column(first, ["reverse_repo", "reverse repo", "reverse repo rate"]),
-        "rbi_sdf": find_column(first, ["standing_deposit_facility_sdf_rate",
-                                       "standing deposit facility sdf rate", "sdf rate"]),
+        "rbi_repo": find_column(first, ["repo_rate", "repo", "repo rate", "policy repo rate"]),
+        "rbi_reverse_repo": find_column(first, ["reverse_repo_rate", "reverse_repo", "reverse repo", "reverse repo rate"]),
+        "rbi_sdf": find_column(first, ["standing_deposit_facility_sdf_rate", "standing deposit facility sdf rate", "sdf rate"]),
     }
 
-    # Typed API layout: named columns such as effective_date, repo, reverse_repo, sdf.
+    # Case 1: typed/normalized API response with useful column names.
     if date_col and all(rate_cols.values()):
         dated = [(d, row) for row in rows if (d := parse_date(row.get(date_col))) is not None]
         dated.sort(key=lambda item: item[0])
@@ -145,110 +154,81 @@ def fetch_rates():
                     result.append(observation(indicator, dt.isoformat(), current[indicator], "%",
                                               "Reserve Bank of India (DBIE) — Key Rates"))
         counts = {k: sum(r["indicator"] == k for r in result) for k in rate_cols}
-        if any(not counts[k] for k in rate_cols):
-            raise RuntimeError(f"Typed Key Rates data missing series: {counts}")
-        print(f"RBI Key Rates (typed): {len(dated)} dates; series counts={counts}; earliest={dated[0][0]}")
+        missing = [k for k, count in counts.items() if count == 0]
+        if missing:
+            raise RuntimeError(f"Typed Key Rates data missing series: {missing}; counts={counts}")
+        print(f"RBI Key Rates (typed): {len(dated)} dates; counts={counts}; earliest={dated[0][0]}")
         return result
 
-    # Report-grid layout observed from DBIE's CSV export: src_file, tab, period,
-    # row_no, c1..c8. Those c* columns contain the original spreadsheet cells, so
-    # find the header row and map columns from their labels instead of assuming positions.
+    # Case 2: faithful spreadsheet-grid export (src_file, tab, period, row_no, c1..c8).
+    # Do not infer columns from merged group headings: their text is stored in different
+    # rows/cells and is the reason the previous parser failed. Use the official leaf
+    # column positions and validate that date and expected rates exist before importing.
     grid_cols = sorted(
         [col for col in first if re.fullmatch(r"c\d+", norm(col))],
         key=lambda col: int(re.search(r"\d+", col).group())
     )
-    if not grid_cols:
-        raise RuntimeError(f"Key Rates columns not recognized; headers={list(first)}")
+    if len(grid_cols) < 5:
+        raise RuntimeError(f"Key Rates report-grid expected c1..c8; headers={list(first)}")
 
+    # Map by numeric suffix (so it remains correct if the export's dict order changes).
+    by_number = {int(re.search(r"\d+", col).group()): col for col in grid_cols}
+    if not all(n in by_number for n in (1, 3, 4, 5)):
+        raise RuntimeError(f"Key Rates report-grid lacks c1/date, c3/repo, c4/reverse repo or c5/SDF; columns={grid_cols}")
+
+    # There is usually one sheet group. Preserve separate sheet/file groups to guard
+    # against future DBIE table layout changes and deduplicate after parsing.
     groups = {}
     for row in rows:
-        group_key = (str(row.get("src_file", "")).strip(), str(row.get("tab", "")).strip())
-        groups.setdefault(group_key, []).append(row)
+        key = (str(row.get("src_file", "")).strip(), str(row.get("tab", "")).strip())
+        groups.setdefault(key, []).append(row)
 
     result = []
-    usable_groups = 0
+    parsed_groups = 0
     for (source_file, tab_name), sheet_rows in groups.items():
-        def row_no(item):
+        def row_number(item):
             try:
                 return int(float(item.get("row_no", 0)))
             except (TypeError, ValueError):
                 return 0
-        sheet_rows.sort(key=row_no)
 
-        header_at = None
-        for idx, row in enumerate(sheet_rows):
-            cell_text = " ".join(str(row.get(col, "") or "") for col in grid_cols).lower()
-            if "effective date" in cell_text:
-                header_at = idx
-                break
-        if header_at is None:
-            continue
-
-        # Include a short window around the header to account for merged/two-row
-        # headers like "Fix Range LAF Rates" above "Repo" and "Reverse Repo".
-        window = sheet_rows[max(0, header_at - 2):min(len(sheet_rows), header_at + 4)]
-        headings = {}
-        for col in grid_cols:
-            parts = []
-            for hrow in window:
-                txt = str(hrow.get(col, "") or "").strip()
-                if not txt or parse_date(txt) is not None or parse_num(txt) is not None:
-                    continue
-                normalized = norm(txt)
-                if normalized not in {norm(part) for part in parts}:
-                    parts.append(txt)
-            headings[col] = " ".join(parts).lower()
-
-        mapped = {}
-        for col, heading in headings.items():
-            normalized = norm(heading)
-            if "effective" in normalized and "date" in normalized:
-                mapped["date"] = col
-            elif "reverse" in heading and "repo" in heading:
-                mapped["rbi_reverse_repo"] = col
-            elif ("standing deposit facility" in heading or re.search(r"\bsdf\b", heading)):
-                mapped["rbi_sdf"] = col
-            elif "repo" in heading and "reverse" not in heading and not re.search(r"\b(sdf|msf)\b", heading):
-                mapped["rbi_repo"] = col
-            # Bank/MSF/CRR/SLR are not dashboard series, but recognizing them is
-            # useful in logs if DBIE changes the report header layout.
-            elif "bank rate" in heading:
-                mapped["bank_rate"] = col
-            elif "marginal standing facility" in heading or re.search(r"\bmsf\b", heading):
-                mapped["msf"] = col
-            elif "cash reserve ratio" in heading or re.search(r"\bcrr\b", heading):
-                mapped["crr"] = col
-            elif "statutory liquidity ratio" in heading or re.search(r"\bslr\b", heading):
-                mapped["slr"] = col
-
-        required = ["date", "rbi_repo", "rbi_reverse_repo", "rbi_sdf"]
-        if any(key not in mapped for key in required):
-            print(f"Key Rates header not fully mapped for {source_file}/{tab_name}: {headings}; mapped={mapped}")
-            continue
-
+        sheet_rows.sort(key=row_number)
         dated = []
         for row in sheet_rows:
-            dt = parse_date(row.get(mapped["date"]))
+            # In RBI Key Rates workbook c1 is the effective-date column. Header rows,
+            # footnotes and titles fail date parsing and are naturally skipped.
+            dt = parse_date(row.get(by_number[1]))
             if dt:
                 dated.append((dt, row))
-        dated.sort(key=lambda item: item[0])
         if not dated:
             continue
+        dated.sort(key=lambda item: item[0])
 
-        current = {key: None for key in ("rbi_repo", "rbi_reverse_repo", "rbi_sdf")}
+        # Official DBIE Key Rates leaf-column positions (as listed on the RBI page):
+        # c2 Bank Rate, c3 Repo, c4 Reverse Repo, c5 SDF, c6 MSF, c7 CRR, c8 SLR.
+        # The requested dashboard uses repo, reverse repo and SDF only.
+        col_map = {
+            "rbi_repo": by_number.get(3),
+            "rbi_reverse_repo": by_number.get(4),
+            "rbi_sdf": by_number.get(5),
+        }
+        current = {key: None for key in col_map}
         for dt, row in dated:
-            for indicator in current:
-                value = parse_num(row.get(mapped[indicator]))
-                # RBI's note defines '-' as no change. Carry forward the last actual
-                # rate change on each effective date so graphs display step histories.
+            for indicator, col in col_map.items():
+                if not col:
+                    continue
+                value = parse_num(row.get(col))
+                # Per the RBI table notes, '-' means unchanged. Carry forward the last
+                # rate change. For SDF, this starts only on the first row with a value.
                 if value is not None:
                     current[indicator] = value
                 if current[indicator] is not None:
-                    result.append(observation(indicator, dt.isoformat(), current[indicator], "%",
-                                              "Reserve Bank of India (DBIE) — Key Rates"))
-        usable_groups += 1
+                    result.append(observation(
+                        indicator, dt.isoformat(), current[indicator], "%",
+                        "Reserve Bank of India (DBIE) — Key Rates"
+                    ))
+        parsed_groups += 1
 
-    # De-duplicate repeated observations across report files/sheets.
     dedup = {}
     for row in result:
         dedup[(row["indicator"], row["period_date"])] = row
@@ -257,14 +237,18 @@ def fetch_rates():
               for key in ("rbi_repo", "rbi_reverse_repo", "rbi_sdf")}
     missing = [key for key, count in counts.items() if count == 0]
     if missing:
+        # Provide a compact but useful diagnostic without dumping hundreds of rows.
+        sample = [{k: row.get(k, "") for k in ("src_file", "tab", "period", "row_no", *grid_cols)}
+                  for row in rows[:12]]
         raise RuntimeError(
-            f"Key Rates report-grid parser found {usable_groups} usable sheets but has no history for {missing}; "
-            f"headers={list(first)}. Could not map the report's effective-date/rate headings."
+            f"Key Rates report-grid parser found {parsed_groups} sheets with dates, but missing {missing}; "
+            f"headers={list(first)}; sample first rows={sample}"
         )
     periods = [row["period_date"] for row in result]
-    print(f"RBI Key Rates (report grid): usable sheets={usable_groups}; counts={counts}; "
+    print(f"RBI Key Rates (report grid): sheets={parsed_groups}; counts={counts}; "
           f"dates={min(periods)} through {max(periods)}")
     return result
+
 
 def fetch_wpi():
     # All Commodities = WPI01, current standard base = 2011-12.
