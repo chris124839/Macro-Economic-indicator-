@@ -6,7 +6,6 @@ on:
     - cron: "0 2 * * *"
   push:
     paths:
-      - "collect_official.py"
       - "collect_india.py"
       - "requirements.txt"
       - ".github/workflows/refresh.yml"
@@ -23,10 +22,7 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Fetch official RBI historical data
-        run: python collect_official.py
-      - name: Normalize additional uploaded Indian source files
-        if: always()
+      - name: Fetch official Indian CPI, WPI and RBI policy-rate history
         run: python collect_india.py
       - name: Verify historical data coverage
         if: always()
@@ -41,10 +37,10 @@ jobs:
               rows = list(csv.DictReader(f))
           print(f"Total observations: {len(rows)}")
           required = ["india_cpi_yoy", "india_wpi_yoy", "rbi_repo", "rbi_reverse_repo", "rbi_sdf"]
-          counts = {k: sum(r.get("indicator") == k for r in rows) for k in required}
+          counts = {key: sum(row.get("indicator") == key for row in rows) for key in required}
           for key, count in counts.items():
               print(f"{key}: {count}")
-          missing = [k for k, count in counts.items() if count == 0]
+          missing = [key for key, count in counts.items() if count == 0]
           if missing:
               sys.exit("Missing historical series: " + ", ".join(missing))
           PY
@@ -55,7 +51,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/observations.csv
           if ! git diff --cached --quiet; then
-            git commit -m "Import official Indian macro history"
+            git commit -m "Refresh official Indian macro history"
             git push
           else
             echo "No changes to commit"
